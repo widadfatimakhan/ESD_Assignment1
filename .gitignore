@@ -1,0 +1,11 @@
+# Python virtual environment (thousands of files — never commit this)
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor / OS junk
+.vscode/
+.DS_Store
+Thumbs.db
