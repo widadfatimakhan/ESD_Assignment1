@@ -1,7 +1,39 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
+from prometheus_client import (
+    Counter, Gauge, Histogram, Summary,
+    generate_latest, CONTENT_TYPE_LATEST,
+)
+import time
 
 app = FastAPI(title="StudySlot")
+# --- Metrics ---
+# A Counter only ever goes up. This one counts successful bookings.
+BOOKINGS_TOTAL = Counter(
+    "studyslot_bookings_total",
+    "Total number of successful room bookings",
+)
+# A Gauge goes up AND down. Rooms occupied right now.
+ROOMS_OCCUPIED = Gauge(
+    "studyslot_rooms_occupied",
+    "Number of room-slots currently booked",
+)
+
+# A Histogram times an operation and sorts each timing into buckets.
+# Buckets are in seconds; these match the ranges your assignment mentions.
+AVAILABILITY_CHECK_SECONDS = Histogram(
+    "studyslot_availability_check_seconds",
+    "Time spent checking room availability during a booking",
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5],
+)
+
+# A Summary also times an operation, but reports a running average
+# (Python summaries don't do percentiles — the histogram covers those).
+AVAILABILITY_CHECK_SUMMARY = Summary(
+    "studyslot_availability_check_summary_seconds",
+    "Summary of availability-check duration (average via _sum / _count)",
+)
 
 # --- Rooms, each with a capacity and a minimum group size ---
 # capacity  = the most students the room fits
@@ -98,8 +130,18 @@ def book(req: BookingRequest):
     info = ROOMS[req.room]
     group_size = len(req.student_ids)
 
-    # Too big for this room?
+    # Start the stopwatch for the availability-check work.
+    start = time.perf_counter()
+
+    def record_check_time():
+        """Record how long the availability check took, into both metrics."""
+        elapsed = time.perf_counter() - start
+        AVAILABILITY_CHECK_SECONDS.observe(elapsed)
+        AVAILABILITY_CHECK_SUMMARY.observe(elapsed)
+
+        # Too big for this room?
     if group_size > info["capacity"]:
+        record_check_time()
         raise HTTPException(status_code=400, detail={
             "reason": "group_too_large",
             "message": f"Room {req.room} holds at most {info['capacity']} students; your group has {group_size}.",
@@ -108,6 +150,7 @@ def book(req: BookingRequest):
 
     # Too small for this room?
     if group_size < info["min_group"]:
+        record_check_time()
         raise HTTPException(status_code=400, detail={
             "reason": "group_too_small",
             "message": f"Room {req.room} needs at least {info['min_group']} students; your group has {group_size}.",
@@ -117,12 +160,16 @@ def book(req: BookingRequest):
     # Already booked?
     key = (req.room, req.slot)
     if key in bookings:
+        record_check_time()
         raise HTTPException(status_code=409, detail={
             "reason": "double_booked",
             "message": f"Room {req.room} is already booked for {req.slot}.",
         })
 
+    record_check_time()
     bookings[key] = req.student_ids
+    BOOKINGS_TOTAL.inc()
+    ROOMS_OCCUPIED.inc()
     return {
         "message": "Booked",
         "room": req.room,
@@ -147,4 +194,10 @@ def cancel(room: str, slot: str):
     if key not in bookings:
         raise HTTPException(status_code=404, detail="No such booking")
     del bookings[key]
+    ROOMS_OCCUPIED.dec()   # that room-slot is free again
     return {"message": "Cancelled", "room": room, "slot": slot}
+
+@app.get("/metrics")
+def metrics():
+    """The page Prometheus scrapes. Plain text, not JSON."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
