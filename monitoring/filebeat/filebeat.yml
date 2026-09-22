@@ -1,0 +1,20 @@
+filebeat.inputs:
+  - type: filestream
+    id: studyslot-logs
+    paths:
+      - /logs/app.log
+    parsers:
+      - ndjson:
+          target: ""
+          overwrite_keys: true
+          add_error_key: true
+
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  index: "studyslot-logs-%{+yyyy.MM.dd}"
+
+setup.ilm.enabled: false
+setup.template.name: "studyslot-logs"
+setup.template.pattern: "studyslot-logs-*"
+
+logging.level: warning

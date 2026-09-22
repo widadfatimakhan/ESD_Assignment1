@@ -92,9 +92,64 @@ produce percentiles in the Python client, so it is reported as an average
 ---
 
 ## Part C — Logging pipeline
-> **TODO:** Filebeat → Elasticsearch → Kibana. What we log, why, and where in
-> the code; how Filebeat parses JSON into fields; where logs live and retention;
-> a sample log with its stored fields and a working Kibana search.
+
+### Pipeline overview
+StudySlot's logs travel through this path:
+
+App writes one JSON line to `studyslot/logs/app.log`
+→ Filebeat (in Docker) reads and parses that file
+→ Elasticsearch (in Docker) stores each line as a searchable document
+→ Kibana (in Docker) is used to search and inspect them.
+
+### What we log, why, and where in the code
+Every booking attempt and cancellation writes exactly one structured JSON
+event via the `log_event()` helper in `studyslot/main.py`. We log at the
+decision points inside `book()` (each rejection branch and the success path)
+and in `cancel()`. This captures *what happened to each request* without
+logging noise on every unrelated call.
+
+Each event carries: `@timestamp` (UTC, ISO-8601), `service.name`, `log.level`
+(`info` for success/cancel, `warning` for rejections), `message`, a per-request
+`request_id` (an 8-char ID generated at the top of `book()`), and context
+fields `room`, `slot`, `group_size`, `status`, and `reason` (for rejections:
+`group_too_large`, `group_too_small`, `double_booked`, etc.). We never log
+student IDs beyond counting them, and no secrets or personal data are logged.
+
+### How Filebeat collects and parses the logs
+Filebeat (`monitoring/filebeat/filebeat.yml`) watches `/logs/app.log` (the
+app's log folder is mounted into the Filebeat container read-only at `/logs`).
+Its `filestream` input tails the file for new lines. The `ndjson` parser reads
+each line as a JSON object and lifts every key to the top level
+(`target: ""`), so `room`, `status`, `request_id`, etc. become individual
+searchable fields in Elasticsearch rather than one opaque text blob. Filebeat
+also adds its own metadata (`agent.*`, `host.name`, `log.file.path`).
+
+### Where logs live, what survives restarts, retention
+Logs are written to `studyslot/logs/app.log` on disk (survives everything) and
+shipped into Elasticsearch under daily indices named `studyslot-logs-YYYY.MM.DD`.
+Elasticsearch currently stores its data inside the container (no named volume
+yet), so `docker compose down` would clear the indexed copy — the on-disk
+`app.log` is the durable source of truth. (A named volume will be added in the
+Dockerize step to make the index persistent.) No automatic deletion (ILM) is
+configured; for this classroom scale, old daily indices can be deleted manually.
+
+### Searching in Kibana
+A data view `StudySlot Logs` over pattern `studyslot-logs-*` (timestamp field
+`@timestamp`) is used in **Discover**. Example searches (KQL):
+- `reason : "group_too_small"` — all rejections of that kind (see screenshot).
+- `status : 200` — all confirmed bookings.
+- `request_id : "<id>"` — trace one specific request end to end.
+- `request_id : a*` — wildcard/pattern match: every request whose ID begins
+  with `a`.
+
+A sample stored event (fields after Filebeat parsing):
+`@timestamp`, `service.name=studyslot`, `log.level=warning`,
+`message="booking rejected"`, `request_id`, `room`, `slot`, `group_size`,
+`status=400`, `reason=group_too_small`, plus Filebeat's `agent.*`,
+`host.name`, `log.file.path=/logs/app.log`.
+
+> Screenshots: Kibana Discover with an expanded event showing parsed fields;
+> the `reason : "group_too_small"` search returning one document.
 
 ## Part D — System design
 > **TODO:** architecture diagram (app + Prometheus + Grafana + logging stack,

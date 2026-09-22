@@ -14,14 +14,22 @@ from datetime import datetime, timezone
 
 SERVICE_NAME = "studyslot"
 
-# A logger that writes each record as-is to stdout (the container captures stdout).
+import os
+
 _logger = logging.getLogger(SERVICE_NAME)
 _logger.setLevel(logging.INFO)
 _logger.propagate = False
 if not _logger.handlers:
-    _handler = logging.StreamHandler(sys.stdout)
-    _handler.setFormatter(logging.Formatter("%(message)s"))  # we format JSON ourselves
-    _logger.addHandler(_handler)
+    # 1) Keep printing to the screen (handy while developing).
+    _stream_handler = logging.StreamHandler(sys.stdout)
+    _stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    _logger.addHandler(_stream_handler)
+
+    # 2) ALSO write each line to a file that Filebeat will read.
+    os.makedirs("logs", exist_ok=True)                 # create logs/ if missing
+    _file_handler = logging.FileHandler("logs/app.log", encoding="utf-8")
+    _file_handler.setFormatter(logging.Formatter("%(message)s"))
+    _logger.addHandler(_file_handler)
 
 
 def log_event(message: str, *, level: str = "INFO", **fields) -> None:
