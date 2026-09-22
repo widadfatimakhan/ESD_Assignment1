@@ -6,6 +6,35 @@ from prometheus_client import (
     generate_latest, CONTENT_TYPE_LATEST,
 )
 import time
+import json
+import logging
+import sys
+import uuid
+from datetime import datetime, timezone
+
+SERVICE_NAME = "studyslot"
+
+# A logger that writes each record as-is to stdout (the container captures stdout).
+_logger = logging.getLogger(SERVICE_NAME)
+_logger.setLevel(logging.INFO)
+_logger.propagate = False
+if not _logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(message)s"))  # we format JSON ourselves
+    _logger.addHandler(_handler)
+
+
+def log_event(message: str, *, level: str = "INFO", **fields) -> None:
+    """Write ONE line of JSON with a timestamp, service name, level, message, and extra fields."""
+    record = {
+        "@timestamp": datetime.now(timezone.utc).isoformat(),
+        "service": {"name": SERVICE_NAME},
+        "log": {"level": level.lower()},
+        "message": message,
+        **fields,
+    }
+    line = json.dumps(record, separators=(",", ":"))
+    getattr(_logger, level.lower(), _logger.info)(line)
 
 app = FastAPI(title="StudySlot")
 # --- Metrics ---
@@ -120,11 +149,22 @@ def availability(slot: str, group_size: int | None = None):
 @app.post("/book")
 def book(req: BookingRequest):
     """Book a room for a slot for a group. Enforces size limits and no double-booking."""
+    request_id = uuid.uuid4().hex[:8]   # short unique ID for this request, e.g. "a3f9c1d2"
+
     if req.room not in ROOMS:
+        log_event("booking rejected", level="WARNING",
+                  request_id=request_id, room=req.room, slot=req.slot,
+                  status=400, reason="unknown_room")
         raise HTTPException(status_code=400, detail=f"Unknown room '{req.room}'")
     if req.slot not in SLOTS:
+        log_event("booking rejected", level="WARNING",
+                  request_id=request_id, room=req.room, slot=req.slot,
+                  status=400, reason="unknown_slot")
         raise HTTPException(status_code=400, detail=f"Unknown slot '{req.slot}'")
     if not req.student_ids:
+        log_event("booking rejected", level="WARNING",
+                  request_id=request_id, room=req.room, slot=req.slot,
+                  status=400, reason="no_student_ids")
         raise HTTPException(status_code=400, detail="At least one student ID is required")
 
     info = ROOMS[req.room]
@@ -139,9 +179,12 @@ def book(req: BookingRequest):
         AVAILABILITY_CHECK_SECONDS.observe(elapsed)
         AVAILABILITY_CHECK_SUMMARY.observe(elapsed)
 
-        # Too big for this room?
+    # Too big for this room?
     if group_size > info["capacity"]:
         record_check_time()
+        log_event("booking rejected", level="WARNING",
+                  request_id=request_id, room=req.room, slot=req.slot,
+                  group_size=group_size, status=400, reason="group_too_large")
         raise HTTPException(status_code=400, detail={
             "reason": "group_too_large",
             "message": f"Room {req.room} holds at most {info['capacity']} students; your group has {group_size}.",
@@ -151,6 +194,9 @@ def book(req: BookingRequest):
     # Too small for this room?
     if group_size < info["min_group"]:
         record_check_time()
+        log_event("booking rejected", level="WARNING",
+                  request_id=request_id, room=req.room, slot=req.slot,
+                  group_size=group_size, status=400, reason="group_too_small")
         raise HTTPException(status_code=400, detail={
             "reason": "group_too_small",
             "message": f"Room {req.room} needs at least {info['min_group']} students; your group has {group_size}.",
@@ -161,6 +207,9 @@ def book(req: BookingRequest):
     key = (req.room, req.slot)
     if key in bookings:
         record_check_time()
+        log_event("booking rejected", level="WARNING",
+                  request_id=request_id, room=req.room, slot=req.slot,
+                  group_size=group_size, status=409, reason="double_booked")
         raise HTTPException(status_code=409, detail={
             "reason": "double_booked",
             "message": f"Room {req.room} is already booked for {req.slot}.",
@@ -170,6 +219,9 @@ def book(req: BookingRequest):
     bookings[key] = req.student_ids
     BOOKINGS_TOTAL.inc()
     ROOMS_OCCUPIED.inc()
+    log_event("booking confirmed", level="INFO",
+              request_id=request_id, room=req.room, slot=req.slot,
+              group_size=group_size, status=200)
     return {
         "message": "Booked",
         "room": req.room,
@@ -194,7 +246,8 @@ def cancel(room: str, slot: str):
     if key not in bookings:
         raise HTTPException(status_code=404, detail="No such booking")
     del bookings[key]
-    ROOMS_OCCUPIED.dec()   # that room-slot is free again
+    ROOMS_OCCUPIED.dec()
+    log_event("booking cancelled", level="INFO", room=room, slot=slot, status=200)
     return {"message": "Cancelled", "room": room, "slot": slot}
 
 @app.get("/metrics")
