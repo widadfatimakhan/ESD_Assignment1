@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s        # visit every target every 5 seconds
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'studyslot'
+    static_configs:
+      - targets: ['host.docker.internal:8000']
