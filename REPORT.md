@@ -1,6 +1,7 @@
-# Enterprise Software Development — Assignment 1: Observability
+# Enterprise Software Development 
+# Assignment 1: Observability
 **StudySlot: a campus study-room booking service**
-Widad Fatima Khan · Habib University · Fall 2026
+Widad Fatima Khan · Habib University
 
 ---
 
@@ -40,12 +41,6 @@ visualised by the monitoring stack described below.
   rejected with a machine-readable reason (`group_too_large`,
   `group_too_small`, `double_booked`) and a list of suggested rooms that fit.
 
-### How to try it
-> **TODO (fill at the end):** exact run commands. For now: activate the venv,
-> `cd studyslot`, `uvicorn main:app --reload`, open `http://127.0.0.1:8000/docs`,
-> and use the `POST /book`, `GET /availability`, `GET /bookings`, and
-> `DELETE /bookings/{room}/{slot}` endpoints.
-
 ---
 
 ## Part B — Metrics and dashboards
@@ -56,7 +51,6 @@ visualised by the monitoring stack described below.
   values as time series.
 - **Grafana** (in Docker) reads from Prometheus and draws live dashboards. The
   Prometheus data source is auto-provisioned on startup.
-> **TODO:** add Node Exporter (machine CPU/memory/disk/network) — not yet done.
 
 ### The four metric types
 
@@ -67,8 +61,6 @@ visualised by the monitoring stack described below.
 | `studyslot_availability_check_seconds` | Histogram | Time for the availability check, bucketed for p95/p99 | seconds | none (buckets) | `book()`, `record_check_time()`: `.observe(elapsed)` |
 | `studyslot_availability_check_summary_seconds` | Summary | Same timing as average (`_sum`/`_count`); Python summaries have no percentiles | seconds | none | `book()`, `record_check_time()`: `.observe(elapsed)` |
 
-> **TODO:** add the self-explored / business metrics (e.g. rejections by reason)
-> once we wire them up, and confirm all four types appear across the project.
 
 ### Dashboard panels (PromQL)
 
@@ -86,8 +78,6 @@ checks in the last 5 minutes were faster than this value." The Summary cannot
 produce percentiles in the Python client, so it is reported as an average
 (`_sum / _count`); the histogram provides p95/p99.
 
-> **TODO:** insert Grafana screenshots (all panels), and one screenshot of the
-> Prometheus `/targets` page showing the target UP.
 
 ---
 
@@ -265,6 +255,3 @@ a `request_id` label, incremented per request only when armed via
    identifiers in **logs** (where StudySlot already puts `request_id`, searchable
    in Kibana at zero metric cost), not in metric labels. The bomb was then
    disarmed (`active=false`).
-
-*Note:* removing a label does not delete already-stored series immediately, and
-the experiment was kept well under 100 unique IDs so as not to stress Prometheus.

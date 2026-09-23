@@ -1,4 +1,4 @@
-# StudySlot — Observability Assignment (ESD Fall 2026)
+# StudySlot: Observability Assignment (ESD)
 
 A campus study-room booking service (Python + FastAPI) instrumented end to end
 with Prometheus + Grafana (metrics) and Filebeat + Elasticsearch + Kibana
