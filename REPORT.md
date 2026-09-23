@@ -295,6 +295,3 @@ a `request_id` label, incremented per request only when armed via
 ## Credits and assistance
 - Tooling stack, JSON logging style, and Prometheus/Grafana provisioning
   conventions follow the course Lab 1 (Midnight Launch).
-- Built with step-by-step guidance from an AI assistant (Claude), used to
-  explain each tool and help write and debug the configuration and report.
-  All code was reviewed, run, and verified locally by me.
