@@ -1,4 +1,4 @@
-# Enterprise Software Development 
+# Enterprise Software Development
 # Assignment 1: Observability
 **StudySlot: a campus study-room booking service**
 Widad Fatima Khan · Habib University
@@ -41,6 +41,11 @@ visualised by the monitoring stack described below.
   rejected with a machine-readable reason (`group_too_large`,
   `group_too_small`, `double_booked`) and a list of suggested rooms that fit.
 
+### How to run it
+The whole system runs with one command from the repo root:
+`docker compose up -d --build`. See `README.md` for URLs and usage. The API and
+its interactive docs are at `http://localhost:8000/docs`.
+
 ---
 
 ## Part B — Metrics and dashboards
@@ -50,7 +55,10 @@ visualised by the monitoring stack described below.
 - **Prometheus** (in Docker) scrapes `/metrics` every 5 seconds and stores the
   values as time series.
 - **Grafana** (in Docker) reads from Prometheus and draws live dashboards. The
-  Prometheus data source is auto-provisioned on startup.
+  Prometheus data source and the dashboard are auto-provisioned on startup.
+- **Node Exporter** (in Docker) exposes machine metrics (CPU, memory, disk,
+  network) which Prometheus also scrapes. The machine measured is the Docker
+  Desktop Linux VM that hosts the containers.
 
 ### The four metric types
 
@@ -61,6 +69,9 @@ visualised by the monitoring stack described below.
 | `studyslot_availability_check_seconds` | Histogram | Time for the availability check, bucketed for p95/p99 | seconds | none (buckets) | `book()`, `record_check_time()`: `.observe(elapsed)` |
 | `studyslot_availability_check_summary_seconds` | Summary | Same timing as average (`_sum`/`_count`); Python summaries have no percentiles | seconds | none | `book()`, `record_check_time()`: `.observe(elapsed)` |
 
+Machine metrics come from Node Exporter (`node_cpu_seconds_total`,
+`node_memory_MemAvailable_bytes`, etc.) and are shown as CPU % and memory %
+panels.
 
 ### Dashboard panels (PromQL)
 
@@ -70,6 +81,8 @@ visualised by the monitoring stack described below.
 | Rooms occupied now | `studyslot_rooms_occupied` | current occupancy (Stat panel) |
 | Availability p95 | `histogram_quantile(0.95, rate(studyslot_availability_check_seconds_bucket[5m]))` | 95th-percentile check time; flat near-zero at baseline |
 | Availability average | `rate(...summary_seconds_sum[5m]) / rate(...summary_seconds_count[5m])` | mean check time, recent |
+| CPU usage % | `100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[1m])))` | machine CPU load |
+| Memory usage % | `100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)` | machine memory in use |
 
 **On percentiles and the time window.** The histogram exposes cumulative
 `_bucket{le="..."}` counts; `histogram_quantile(0.95, rate(...[5m]))` estimates
@@ -78,18 +91,27 @@ checks in the last 5 minutes were faster than this value." The Summary cannot
 produce percentiles in the Python client, so it is reported as an average
 (`_sum / _count`); the histogram provides p95/p99.
 
+Screenshots of the dashboard, the Prometheus targets page (both targets UP), and
+the CPU/memory panels are in `report-images/`.
 
 ---
 
 ## Part C — Logging pipeline
 
 ### Pipeline overview
-StudySlot's logs travel through this path:
+StudySlot's logs follow the container-native path:
 
-App writes one JSON line to `studyslot/logs/app.log`
-→ Filebeat (in Docker) reads and parses that file
+The app writes one JSON line per event to its stdout
+→ Docker captures the container's stdout to a log file
+→ Filebeat (in Docker) reads and parses that log
 → Elasticsearch (in Docker) stores each line as a searchable document
 → Kibana (in Docker) is used to search and inspect them.
+
+(An earlier version of the app also wrote the same JSON to a file,
+`studyslot/logs/app.log`, which Filebeat read directly with a `filestream`
+input and `ndjson` parser. That approach is preserved in the project's git
+history. The final, submitted version uses container autodiscovery, described
+next, so everything runs from a single `docker compose up`.)
 
 ### What we log, why, and where in the code
 Every booking attempt and cancellation writes exactly one structured JSON
@@ -106,26 +128,31 @@ fields `room`, `slot`, `group_size`, `status`, and `reason` (for rejections:
 student IDs beyond counting them, and no secrets or personal data are logged.
 
 ### How Filebeat collects and parses the logs
-Filebeat (`monitoring/filebeat/filebeat.yml`) watches `/logs/app.log` (the
-app's log folder is mounted into the Filebeat container read-only at `/logs`).
-Its `filestream` input tails the file for new lines. The `ndjson` parser reads
-each line as a JSON object and lifts every key to the top level
-(`target: ""`), so `room`, `status`, `request_id`, etc. become individual
+Filebeat (`monitoring/filebeat/filebeat.yml`) uses Docker autodiscover, scoped
+by a condition to containers whose image name contains `studyslot` — so it
+collects only the app's logs, not the whole stack. It reads the app container's
+log file under `/var/lib/docker/containers/.../*.log`, and its inline JSON
+parsing (`json.keys_under_root: true`) lifts every key of each JSON line to a
+top-level field, so `room`, `status`, `request_id`, etc. become individual
 searchable fields in Elasticsearch rather than one opaque text blob. Filebeat
-also adds its own metadata (`agent.*`, `host.name`, `log.file.path`).
+also adds metadata (`agent.*`, `host.name`, `container.*`, `log.file.path`).
+
+Note: Uvicorn's own startup lines are plain text (not JSON); they appear as raw
+`message` strings. All application events are queried by filtering
+`service.name : "studyslot"`, which selects only the structured logs.
 
 ### Where logs live, what survives restarts, retention
-Logs are written to `studyslot/logs/app.log` on disk (survives everything) and
-shipped into Elasticsearch under daily indices named `studyslot-logs-YYYY.MM.DD`.
-Elasticsearch currently stores its data inside the container (no named volume
-yet), so `docker compose down` would clear the indexed copy — the on-disk
-`app.log` is the durable source of truth. (A named volume will be added in the
-Dockerize step to make the index persistent.) No automatic deletion (ILM) is
-configured; for this classroom scale, old daily indices can be deleted manually.
+Logs are shipped into Elasticsearch under daily indices named
+`studyslot-logs-YYYY.MM.DD`. Elasticsearch stores its data inside the container,
+so `docker compose down -v` (which removes volumes) clears the index; the app's
+own stdout is regenerated on each run. No automatic deletion (ILM) is
+configured; for this classroom scale, old daily indices can be deleted manually
+(e.g. `DELETE /_data_stream/studyslot-logs-*`).
 
 ### Searching in Kibana
 A data view `StudySlot Logs` over pattern `studyslot-logs-*` (timestamp field
 `@timestamp`) is used in **Discover**. Example searches (KQL):
+- `service.name : "studyslot"` — only the app's structured events.
 - `reason : "group_too_small"` — all rejections of that kind (see screenshot).
 - `status : 200` — all confirmed bookings.
 - `request_id : "<id>"` — trace one specific request end to end.
@@ -136,15 +163,18 @@ A sample stored event (fields after Filebeat parsing):
 `@timestamp`, `service.name=studyslot`, `log.level=warning`,
 `message="booking rejected"`, `request_id`, `room`, `slot`, `group_size`,
 `status=400`, `reason=group_too_small`, plus Filebeat's `agent.*`,
-`host.name`, `log.file.path=/logs/app.log`.
+`host.name`, `container.name=studyslot-app`.
 
-> Screenshots: Kibana Discover with an expanded event showing parsed fields;
-> the `reason : "group_too_small"` search returning one document.
+Screenshot: Kibana Discover with the `reason : "group_too_small"` search
+returning one document, expanded to show its parsed fields
+(`report-images/Screenshot 2026-09-23 022755.png`).
+
+---
 
 ## Part D — System design
 
 ### 1. Architecture diagram
-See `report-images/architecture-diagram.png`. The system has two
+See `report-images/architecture-diagram.drawio.png`. The system has two
 observability flows, both fed by the StudySlot app and all running as Docker
 Compose containers on one private network:
 
@@ -152,14 +182,15 @@ Compose containers on one private network:
   every 5s and stores the values; Grafana queries Prometheus and draws
   dashboards. `node-exporter` also exposes machine metrics that Prometheus
   scrapes.
-- **Logs path:** the app writes one JSON line per event to `logs/app.log`;
-  Filebeat reads and parses that file; Elasticsearch stores each line as a
-  searchable document; Kibana is the search UI.
+- **Logs path:** the app writes one JSON line per event to stdout; Docker
+  captures it; Filebeat reads and parses it; Elasticsearch stores each line as
+  a searchable document; Kibana is the search UI.
 
 **What each component does / how they communicate.** Containers talk over the
 Docker network by service name (e.g. Grafana → `http://prometheus:9090`,
-Filebeat → `http://elasticsearch:9200`). Prometheus uses a *pull* model (it
-fetches `/metrics`); the log path is *push* (Filebeat ships lines onward).
+Prometheus → `studyslot-app:8000`, Filebeat → `http://elasticsearch:9200`).
+Prometheus uses a *pull* model (it fetches `/metrics`); the log path is *push*
+(Filebeat ships lines onward).
 
 **Where data is stored and why.** Metrics live in Prometheus's time-series
 database (efficient for numeric series over time). Logs live in Elasticsearch
@@ -174,8 +205,8 @@ vs "what exactly happened on this request?" (logs).
   path.
 - If Grafana stops: metrics are still collected by Prometheus; only the
   visualization is lost.
-- If Elasticsearch stops: Filebeat buffers/retries and Kibana can't search,
-  but the app still writes `app.log`, so no log data is lost at the source.
+- If Elasticsearch stops: Filebeat retries and Kibana can't search, but the
+  app keeps emitting logs to stdout, so no log data is lost at the source.
 - If the app stops: no new metrics or logs, and Prometheus marks the target
   DOWN on its /targets page — which is itself a useful signal.
 
@@ -200,15 +231,17 @@ vs "what exactly happened on this request?" (logs).
 **A log — a booking event.**
 1. *Code writes it:* `book()` calls `log_event("booking confirmed", ...,
    request_id=..., room=..., slot=..., status=200)`, which writes one JSON
-   line to `logs/app.log`.
-2. *Filebeat collects and parses it:* Filebeat tails `/logs/app.log` and its
-   `ndjson` parser lifts each JSON key to a top-level searchable field.
+   line to stdout.
+2. *Filebeat collects and parses it:* Filebeat reads the app container's log
+   and its inline JSON parsing lifts each key to a top-level searchable field.
 3. *Elasticsearch stores it:* indexed into `studyslot-logs-YYYY.MM.DD`.
 4. *Kibana finds it:* in Discover, `request_id : "<id>"` returns that single
    event; `reason : "group_too_small"` returns all rejections of that kind.
-   The format changes along the way: a raw one-line JSON string in the file
+   The format changes along the way: a raw one-line JSON string on stdout
    becomes a structured document with fields (`room`, `status`, `reason`,
-   plus Filebeat's `agent.*`, `host.name`, `log.file.path`) in Elasticsearch.
+   plus Filebeat's `agent.*`, `host.name`, `container.*`) in Elasticsearch.
+
+---
 
 ## Part E — Experiments
 
@@ -254,4 +287,14 @@ a `request_id` label, incremented per request only when armed via
    series, exhausting Prometheus's memory. The fix is to keep high-cardinality
    identifiers in **logs** (where StudySlot already puts `request_id`, searchable
    in Kibana at zero metric cost), not in metric labels. The bomb was then
-   disarmed (`active=false`).
+   disarmed (`active=false`). Removing a label does not immediately delete
+   series already stored; they age out with the index.
+
+---
+
+## Credits and assistance
+- Tooling stack, JSON logging style, and Prometheus/Grafana provisioning
+  conventions follow the course Lab 1 (Midnight Launch).
+- Built with step-by-step guidance from an AI assistant (Claude), used to
+  explain each tool and help write and debug the configuration and report.
+  All code was reviewed, run, and verified locally by me.
