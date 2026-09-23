@@ -55,6 +55,18 @@ services:
     command: ["filebeat", "-e", "--strict.perms=false"]
     volumes:
       - ./monitoring/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
-      - ./studyslot/logs:/logs:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     depends_on:
       - elasticsearch
+      - studyslot-app
+
+  studyslot-app:
+    build: ./studyslot
+    container_name: studyslot-app
+    ports:
+      - "8000:8000"
+    labels:
+      - "co.elastic.logs/json.keys_under_root=true"
+      - "co.elastic.logs/json.overwrite_keys=true"
+      - "co.elastic.logs/json.add_error_key=true"
