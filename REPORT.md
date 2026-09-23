@@ -152,13 +152,119 @@ A sample stored event (fields after Filebeat parsing):
 > the `reason : "group_too_small"` search returning one document.
 
 ## Part D — System design
-> **TODO:** architecture diagram (app + Prometheus + Grafana + logging stack,
-> with arrows, data stores, and failure notes); and a walk-through of one metric
-> and one log end-to-end.
+
+### 1. Architecture diagram
+See `report-images/architecture-diagram.png`. The system has two
+observability flows, both fed by the StudySlot app and all running as Docker
+Compose containers on one private network:
+
+- **Metrics path:** `studyslot-app` exposes `/metrics`; Prometheus scrapes it
+  every 5s and stores the values; Grafana queries Prometheus and draws
+  dashboards. `node-exporter` also exposes machine metrics that Prometheus
+  scrapes.
+- **Logs path:** the app writes one JSON line per event to `logs/app.log`;
+  Filebeat reads and parses that file; Elasticsearch stores each line as a
+  searchable document; Kibana is the search UI.
+
+**What each component does / how they communicate.** Containers talk over the
+Docker network by service name (e.g. Grafana → `http://prometheus:9090`,
+Filebeat → `http://elasticsearch:9200`). Prometheus uses a *pull* model (it
+fetches `/metrics`); the log path is *push* (Filebeat ships lines onward).
+
+**Where data is stored and why.** Metrics live in Prometheus's time-series
+database (efficient for numeric series over time). Logs live in Elasticsearch
+(built for full-text search over structured documents). Grafana and Kibana
+store no primary data — they only read and display. This split matches the
+two questions being asked: "how is the system behaving over time?" (metrics)
+vs "what exactly happened on this request?" (logs).
+
+**What happens if a component stops.**
+- If Prometheus stops: Grafana panels go blank (no data source), but the app
+  keeps serving bookings — monitoring is observational, not in the request
+  path.
+- If Grafana stops: metrics are still collected by Prometheus; only the
+  visualization is lost.
+- If Elasticsearch stops: Filebeat buffers/retries and Kibana can't search,
+  but the app still writes `app.log`, so no log data is lost at the source.
+- If the app stops: no new metrics or logs, and Prometheus marks the target
+  DOWN on its /targets page — which is itself a useful signal.
+
+### 2. Follow a metric and a log
+
+**A metric — `studyslot_availability_check_seconds` (the Part E delay).**
+1. *Code updates it:* inside `book()`, `record_check_time()` calls
+   `AVAILABILITY_CHECK_SECONDS.observe(elapsed)`, recording how long the
+   availability check took.
+2. *Prometheus collects and stores it:* every 5s Prometheus scrapes
+   `/metrics` and reads the histogram buckets
+   (`studyslot_availability_check_seconds_bucket{le="..."}`), storing them as
+   time series.
+3. *Grafana queries and displays it:* the p95 panel runs
+   `histogram_quantile(0.95, rate(studyslot_availability_check_seconds_bucket[5m]))`.
+4. *Values observed (Part E):* at baseline p95 ≈ 0.005s; after injecting a
+   0.5s delay via `POST /chaos/delay?seconds=0.5`, p95 rose to ≈ 0.95s (the
+   0.5s timing lands in the `le="1.0"` bucket, so the quantile estimate
+   interpolates high); after disabling the delay it fell back to baseline.
+   See `report-images/partE-p95-full.png`.
+
+**A log — a booking event.**
+1. *Code writes it:* `book()` calls `log_event("booking confirmed", ...,
+   request_id=..., room=..., slot=..., status=200)`, which writes one JSON
+   line to `logs/app.log`.
+2. *Filebeat collects and parses it:* Filebeat tails `/logs/app.log` and its
+   `ndjson` parser lifts each JSON key to a top-level searchable field.
+3. *Elasticsearch stores it:* indexed into `studyslot-logs-YYYY.MM.DD`.
+4. *Kibana finds it:* in Discover, `request_id : "<id>"` returns that single
+   event; `reason : "group_too_small"` returns all rejections of that kind.
+   The format changes along the way: a raw one-line JSON string in the file
+   becomes a structured document with fields (`room`, `status`, `reason`,
+   plus Filebeat's `agent.*`, `host.name`, `log.file.path`) in Elasticsearch.
 
 ## Part E — Experiments
-> **TODO:** (1) inject a delay into the availability check and show before/during/
-> after on the p95 panel; (2) cardinality experiment with a `request_id`-style
-> label, showing series growth then removal.
 
----
+### Experiment 1: Reproduce a problem (injected latency)
+**Setup.** A chaos toggle (`POST /chaos/delay?seconds=X`) sets a global
+`INJECTED_DELAY` that is applied with `time.sleep()` inside the timed
+availability-check section of `book()`. This makes the fault repeatable and
+reversible without editing code mid-experiment.
+
+1. **Normal behaviour.** With delay = 0, ~5 bookings were made. The p95 panel
+   (`histogram_quantile(0.95, rate(studyslot_availability_check_seconds_bucket[5m]))`)
+   sat flat at ≈ 0.005s. See `report-images/partE-p95-before.png`.
+2. **Prediction.** Injecting a 0.5s delay should push p95 toward 0.5s and lift
+   the average, while bookings still succeed (a latency problem, not an error).
+3. **Inject.** `POST /chaos/delay?seconds=0.5`, then ~6–8 bookings. Each
+   response visibly took ~0.5s.
+4. **Observed.** p95 jumped from ≈ 0.005s to ≈ 0.95s (the 0.5s timing falls in
+   the `le="1.0"` bucket, so the quantile estimate interpolates high); the
+   average panel rose too; bookings still returned 200. This is the classic
+   "slow, not failing" signature. See `report-images/partE-p95-full.png`,
+   which shows baseline → plateau → recovery in one view.
+5. **Recover.** `POST /chaos/delay?seconds=0`, then more bookings; p95 ramped
+   back down to baseline over the 5-minute query window, confirming recovery.
+
+**Effect on users.** Every booking took about half a second longer. The system
+kept working but felt sluggish — the kind of degradation metrics catch before
+users complain.
+
+### Experiment 2: Cardinality explosion
+**Setup.** A deliberately unsafe counter `studyslot_requests_by_id_total` with
+a `request_id` label, incremented per request only when armed via
+`POST /chaos/cardinality?active=true`.
+
+1. **Baseline.** `count(studyslot_requests_by_id_total)` in Prometheus returned
+   an empty result — zero series. See `report-images/cardinality-explosion-before.png`.
+2. **Arm and load.** Enabled the bomb and made ~19 requests (mixed successes
+   and rejections; each gets a unique `request_id`).
+3. **Series growth.** `count(studyslot_requests_by_id_total)` climbed to ≈ 19 —
+   one new time series per unique ID. See `report-images/cardinality-explosion-after.png`.
+4. **Cost at scale and the fix.** Cardinality is the product of a metric's
+   distinct label-value combinations. An unbounded label like `request_id`
+   creates a new series per request — at millions of requests, millions of
+   series, exhausting Prometheus's memory. The fix is to keep high-cardinality
+   identifiers in **logs** (where StudySlot already puts `request_id`, searchable
+   in Kibana at zero metric cost), not in metric labels. The bomb was then
+   disarmed (`active=false`).
+
+*Note:* removing a label does not delete already-stored series immediately, and
+the experiment was kept well under 100 unique IDs so as not to stress Prometheus.
