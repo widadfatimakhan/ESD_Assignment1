@@ -46,6 +46,17 @@ def log_event(message: str, *, level: str = "INFO", **fields) -> None:
 
 app = FastAPI(title="StudySlot")
 # --- Metrics ---
+# DELIBERATELY BAD metric for the cardinality experiment: a per-request-ID label.
+# Each unique request_id creates a NEW time series -> cardinality explosion.
+CARDINALITY_DEMO = Counter(
+    "studyslot_requests_by_id_total",
+    "UNSAFE demo: one series per unique request_id",
+    ["request_id"],
+)
+
+# Toggle so we only explode cardinality when we choose to.
+CARDINALITY_BOMB_ON = False
+
 # A Counter only ever goes up. This one counts successful bookings.
 BOOKINGS_TOTAL = Counter(
     "studyslot_bookings_total",
@@ -56,6 +67,8 @@ ROOMS_OCCUPIED = Gauge(
     "studyslot_rooms_occupied",
     "Number of room-slots currently booked",
 )
+# Chaos: artificial delay (seconds) injected into the availability check. 0 = off.
+INJECTED_DELAY = 0.0
 
 # A Histogram times an operation and sorts each timing into buckets.
 # Buckets are in seconds; these match the ranges your assignment mentions.
@@ -158,6 +171,8 @@ def availability(slot: str, group_size: int | None = None):
 def book(req: BookingRequest):
     """Book a room for a slot for a group. Enforces size limits and no double-booking."""
     request_id = uuid.uuid4().hex[:8]   # short unique ID for this request, e.g. "a3f9c1d2"
+    if CARDINALITY_BOMB_ON:
+        CARDINALITY_DEMO.labels(request_id=request_id).inc()
 
     if req.room not in ROOMS:
         log_event("booking rejected", level="WARNING",
@@ -180,6 +195,7 @@ def book(req: BookingRequest):
 
     # Start the stopwatch for the availability-check work.
     start = time.perf_counter()
+    time.sleep(INJECTED_DELAY)   # chaos: 0 normally; >0 when delay is injected
 
     def record_check_time():
         """Record how long the availability check took, into both metrics."""
@@ -262,3 +278,25 @@ def cancel(room: str, slot: str):
 def metrics():
     """The page Prometheus scrapes. Plain text, not JSON."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.post("/chaos/delay")
+def set_delay(seconds: float = 0.0):
+    """Turn the artificial availability-check delay on/off. seconds=0 disables it."""
+    global INJECTED_DELAY
+    INJECTED_DELAY = seconds
+    log_event("chaos delay set", level="WARNING", injected_delay_seconds=seconds)
+    return {"injected_delay_seconds": INJECTED_DELAY}
+
+
+@app.get("/chaos/status")
+def chaos_status():
+    """Show current chaos state."""
+    return {"injected_delay_seconds": INJECTED_DELAY}
+
+@app.post("/chaos/cardinality")
+def set_cardinality(active: bool = False):
+    """Arm/disarm the cardinality bomb (per-request_id metric label)."""
+    global CARDINALITY_BOMB_ON
+    CARDINALITY_BOMB_ON = active
+    log_event("chaos cardinality set", level="WARNING", cardinality_bomb=active)
+    return {"cardinality_bomb": CARDINALITY_BOMB_ON}
