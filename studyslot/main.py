@@ -71,7 +71,7 @@ ROOMS_OCCUPIED = Gauge(
 INJECTED_DELAY = 0.0
 
 # A Histogram times an operation and sorts each timing into buckets.
-# Buckets are in seconds; these match the ranges your assignment mentions.
+# Buckets are in seconds; these match the ranges the assignment mentions.
 AVAILABILITY_CHECK_SECONDS = Histogram(
     "studyslot_availability_check_seconds",
     "Time spent checking room availability during a booking",
